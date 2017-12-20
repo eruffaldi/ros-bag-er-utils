@@ -1,10 +1,21 @@
 #!/usr/bin/env python
-#from https://github.com/OSUrobotics/bag2video/blob/master/bag2video.py
 from __future__ import division
 import rosbag, rospy, numpy as np
 import sys, os, cv2, glob
 from itertools import izip, repeat
 import argparse
+import signal
+
+
+dostop=False
+def signal_handler(signal, frame):
+    global dostop
+    print('You pressed Ctrl+C!')
+    if dostop:
+        sys.exit(0)
+    dostop=True
+signal.signal(signal.SIGINT, signal_handler)
+
 
 # try to find cv_bridge:
 try:
@@ -20,6 +31,8 @@ except ImportError:
         print "If ROS version is pre-Groovy, try putting this package in ROS_PACKAGE_PATH"
         sys.exit(1)
 
+#NOT USED
+#from https://github.com/OSUrobotics/bag2video/blob/master/bag2video.py
 def get_info(bag, topic=None, start_time=rospy.Time(0), stop_time=rospy.Time(sys.maxint)):
     size = (0,0)
     times = []
@@ -37,67 +50,182 @@ def get_info(bag, topic=None, start_time=rospy.Time(0), stop_time=rospy.Time(sys
     diffs = 1/np.diff(times)
     return np.median(diffs), min(diffs), max(diffs), size, times
 
+
+#NOT USED
+#from https://github.com/OSUrobotics/bag2video/blob/master/bag2video.py
 def calc_n_frames(times, precision=10):
     # the smallest interval should be one frame, larger intervals more
     intervals = np.diff(times)
     return np.int64(np.round(precision*intervals/min(intervals)))
 
-def write_frames(bag, writer, total, topic=None, nframes=repeat(1), start_time=rospy.Time(0), stop_time=rospy.Time(sys.maxint), viz=False, encoding='bgr8'):
-    bridge = CvBridge()
-    if viz:
-        cv2.namedWindow('win')
-    count = 1
-    iterator = bag.read_messages(topics=topic, start_time=start_time, end_time=stop_time)
-    for (topic, msg, time), reps in izip(iterator, nframes):
-        print '\rWriting frame %s of %s at time %s' % (count, total, time),
-        img = np.asarray(bridge.imgmsg_to_cv(msg, 'bgr8'))
-        for rep in range(reps):
-            writer.write(img)
-        imshow('win', img)
-        count += 1
 
-def imshow(win, img):
-    cv2.imshow(win, img)
-    cv2.waitKey(1)
+class ImageVideoWriter:
+    def __init__(self,topic,outfile,encoding,fourcc,dis):
+        self.topic = topic
+        self.outfile = outfile
+        self.display = dis
+        self.fourcc = fourcc
+        self.encoding = encoding
+        self.encoder = None
+        self.bridge = CvBridge()
+        self.rate = 30
+        self.timestampfile = open(outfile + ".timestamp","w")
+        if self.display:
+            cv2.namedWindow(self.topic)
+    def message(self,msg,time):
+        # ?? or use mes
+        self.timestampfile.write("%f\n" % msg.header.stamp.to_time())
+        size = (msg.width, msg.height) #for opencv
+        img = np.asarray(self.bridge.imgmsg_to_cv2(msg, 'bgr8'))
+        if self.encoder is None:
+           self.encoder = cv2.VideoWriter(self.outfile, cv2.VideoWriter_fourcc(*self.fourcc), self.rate, size)
+        # TODO reps
+        self.encoder.write(img)
+        if self.display:
+            cv2.imshow(self.topic, img)
 
-def noshow(win, img):
-    pass
+    def message1(self,msg,time):
+        #first pass for precisely estimating timestamp
+        pass
+    def close(self):
+        if self.encoder:
+            self.encoder.release()
+
+class DepthVideoWriter:
+    def __init__(self,topic,outfile,en,fourcc,dis):
+        self.topic = topic
+        self.encoding = en
+        self.fourcc = fourcc
+        self.outfile = outfile
+        self.display = dis
+        self.encoder = None
+        self.bridge = CvBridge()
+        self.rate = 30
+        self.timestampfile = open(outfile + ".timestamp","w")
+        if self.display:
+            cv2.namedWindow(self.topic)
+    def message(self,msg,time):
+        self.timestampfile.write("%f\n" % msg.header.stamp.to_time())
+        size = (msg.width, msg.height)
+        dimg = np.asarray(self.bridge.imgmsg_to_cv2(msg, '16UC1'))
+        img = np.zeros((msg.height,msg.width,3),dtype=np.uint8)
+        #most significative on blue (first)
+        img[:,:,1] = np.bitwise_and(dimg,0xFF).astype(np.uint8)
+        img[:,:,0] = np.right_shift(dimg,8).astype(np.uint8)
+        img[:,:,2] = img[:,:,0]
+        if self.encoder is None:
+           self.encoder = cv2.VideoWriter(self.outfile, cv2.VideoWriter_fourcc(*self.fourcc), self.rate, size)
+        self.encoder.write(img)
+        if self.display:
+            cv2.imshow(self.topic, img)
+    def message1(self,msg,time):
+        #first pass
+        pass
+    def close(self):
+        if self.encoder:
+            self.encoder.release()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Extract and encode video from bag files.')
+
+
+    parser.add_argument('--outpath')
     parser.add_argument('--outfile', '-o', action='store', default=None,
+                        help='Destination of the video file. Defaults to the location of the input file.')
+    parser.add_argument('--doutfile', '-O', action='store', default=None,
                         help='Destination of the video file. Defaults to the location of the input file.')
     parser.add_argument('--precision', '-p', action='store', default=10, type=int,
                         help='Precision of variable framerate interpolation. Higher numbers\
                         match the actual framerater better, but result in larger files and slower conversion times.')
-    parser.add_argument('--viz', '-v', action='store_true', help='Display frames in a GUI window.')
     parser.add_argument('--start', '-s', action='store', default=rospy.Time(0), type=rospy.Time,
                         help='Rostime representing where to start in the bag.')
-    parser.add_argument('--end', '-e', action='store', default=rospy.Time(sys.maxint), type=rospy.Time,
+    parser.add_argument('--stop', '-S', action='store', default=rospy.Time(sys.maxint), type=rospy.Time,
                         help='Rostime representing where to stop in the bag.')
     parser.add_argument('--encoding', choices=('rgb8', 'bgr8', 'mono8'), default='bgr8',
                         help='Encoding of the deserialized image.')
+    parser.add_argument('--dtopic')
+    parser.add_argument('--display',action="store_true")
+    parser.add_argument('--ddisplay',action="store_true")
+    parser.add_argument('--twopasses',action="store_true")
+    parser.add_argument('--fourcc',default="H264")
+    parser.add_argument('--dfourcc',default="FFV1",help="lossless is suggested, e.g. HFYU FFV1")
 
-    parser.add_argument('topic')
+    parser.add_argument('--topic')
     parser.add_argument('bagfile')
 
     args = parser.parse_args()
 
-    if not args.viz:
-        imshow = noshow
+
 
     for bagfile in glob.glob(args.bagfile):
         print bagfile
+        if dostop:
+            break
         outfile = args.outfile
-        if not outfile:
-            outfile = os.path.join(*os.path.split(bagfile)[-1].split('.')[:-1]) + '.avi'
+        #if not outfile:
+        #    outfile = os.path.join(*os.path.split(bagfile)[-1].split('.')[:-1]) + '.avi'
         bag = rosbag.Bag(bagfile, 'r')
-        print 'Calculating video properties'
-        rate, minrate, maxrate, size, times = get_info(bag, args.topic, start_time=args.start, stop_time=args.end)
-        nframes = calc_n_frames(times, args.precision)
+
+        if args.outfile is None:
+            if args.outpath:
+                outfile = os.path.join(args.outpath,os.path.splitext(os.path.split(bagfile)[-1])[0]+".avi")
+            else:
+                outfile = os.path.join(*os.path.split(bagfile)[-1].split('.')[:-1]) + '.avi'
+        else:
+            outfile = args.outfile
+
+        if args.doutfile is None:
+            if args.outpath:
+                doutfile = os.path.join(args.outpath,os.path.splitext(os.path.split(bagfile)[-1])[0]+"-D.avi")
+            else:
+                doutfile = os.path.join(*os.path.split(bagfile)[-1].split('.')[:-1]) + '-D.avi'
+        else:
+            doutfile = args.doutfile
+
+        aa = None
+        ab = None
+        topics = []
+        if args.topic:
+            aa = ImageVideoWriter(args.topic,outfile,args.encoding,args.fourcc,args.display)
+            topics.append(args.topic)
+            print "looking for color with",aa.topic
+        if args.dtopic:
+            ab = DepthVideoWriter(args.dtopic,doutfile,"",args.dfourcc,args.ddisplay)
+            topics.append(args.dtopic)
+            print "looking for depth with",ab.topic
+
+        #        print 'Calculating video properties'
+        #rate, minrate, maxrate, size, times = get_info(bag, args.topic, start_time=args.start, stop_time=args.end)
+        #nframes = calc_n_frames(times, args.precision)
         # writer = cv2.VideoWriter(outfile, cv2.cv.CV_FOURCC(*'DIVX'), rate, size)
-        writer = cv2.VideoWriter(outfile, cv2.cv.CV_FOURCC(*'DIVX'), np.ceil(maxrate*args.precision), size)
-        print 'Writing video'
-        write_frames(bag, writer, len(times), topic=args.topic, nframes=nframes, start_time=args.start, stop_time=args.end, encoding=args.encoding)
-        writer.release()
-        print '\n'
+        #writer = cv2.VideoWriter(outfile, cv2.cv.CV_FOURCC(*'DIVX'), np.ceil(maxrate*args.precision), size)
+        #print 'Writing video'
+        #write_frames(bag, writer, len(times), topic=args.topic, nframes=nframes, start_time=args.start, stop_time=args.end, encoding=args.encoding)
+        #writer.release()
+        #print '\n'
+        if args.twopasses:
+            iterator = bag.read_messages(topics=topics, start_time=args.start, end_time=args.stop)
+            for (topic, msg, time) in iterator:
+                if dostop:
+                    break
+                if aa and aa.topic == topic:
+                    aa.message1(msg,time)
+                elif ab and ab.topic == topic:
+                    ab.message1(msg.time)
+        print aa,ab
+        iterator = bag.read_messages(topics=topics, start_time=args.start, end_time=args.stop)
+        for (topic, msg, time) in iterator:
+            if dostop:
+                break
+            if aa is not None and aa.topic == topic:
+                aa.message(msg,time)
+            if ab  is not None and ab.topic == topic:
+                ab.message(msg,time)
+            else:
+                continue
+            if args.display or args.ddisplay:
+                cv2.waitKey(1)
+        if aa:
+            aa.close()
+        if ab:
+            ab.close()
