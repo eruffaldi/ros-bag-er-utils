@@ -11,8 +11,48 @@ import json
 import yaml
 import message_filters
 from sensor_msgs.msg import Image
+import imageio
+import ctypes
+import struct
+try:
+    import xnencdec
+except:
+    pass
 
-   
+class XNEncWriter:
+    def __init__(self,outfile,size,maxvalue=7000):
+        self.outfile = open(outfile,"wb")
+        self.outfile.write(struct.pack("ii",size[0],size[1])) # first row is size of image
+        self.buffer = np.empty((size[0]*size[1]*2,1),dtype=np.uint8) # maximxum as not compressed
+        self.maxvalue = maxvalue
+        self.pbuffer = self.buffer.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+        print "xenc16 writer with size",size,"and",self.buffer.size
+    def append_data(self,x):
+        self.write(x)
+    def write(self,x):
+        pin = x.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
+        state,size = xnencdec.doXnStreamCompressDepth16ZWithEmbTablePTR(pin,x.size*2,self.pbuffer,self.buffer.size,self.maxvalue)
+        self.outfile.write(struct.pack("i",size)) # header
+        self.buffer[0:size].tofile(self.outfile)
+    def close(self):
+        self.outfile.close()
+
+class PNGWriter:
+    def __init__(self,outfile,size,maxvalue):
+        self.outfile = open(outfile,"wb")
+        self.outfile.write(struct.pack("ii",size[0],size[1])) # first row is size of image
+        self.maxvalue = maxvalue
+    def append_data(self,x):
+        self.write(x)
+    def write(self,x):
+        if self.maxvalue != 0:
+            x[x > self.maxvalue] = 0
+        r, o = cv2.imencode(".png",x)
+        self.outfile.write(struct.pack("i",len(o))) # header
+        self.outfile.write(o)
+    def close(self):
+        self.outfile.close()
+
 def msg2json(msg):
    ''' Convert a ROS message to JSON format'''
    y = yaml.load(str(msg))
@@ -101,17 +141,20 @@ class CameraInfoWriter:
     def message(self,msg,time):
         #first pass for precisely estimating timestamp
         if not self.done:
+            print "emitting camerainfo"
             self.outfilef.write(msg2json(msg))
+            self.outfilef.close()
             self.done = True
     def close(self):
-        self.outfilef.close()
-
+        pass
 class ImageVideoWriter:
-    def __init__(self,topic,outfile,encoding,fourcc,dis):
+    def __init__(self,topic,outfile,encoding,fourcc,dis,nframes):
         self.topic = topic
         self.outfile = outfile
         self.display = dis
         self.fourcc = fourcc
+        self.nframes = nframes
+        self.frame = 0
         self.encoding = encoding
         self.encoder = None
         self.bridge = CvBridge()
@@ -120,6 +163,7 @@ class ImageVideoWriter:
         if self.display:
             cv2.namedWindow(self.topic)
     def message(self,msg,time):
+        global dostop
         # ?? or use mes
         self.timestampfile.write("%f\n" % msg.header.stamp.to_time())
         size = (msg.width, msg.height) #for opencv
@@ -128,6 +172,9 @@ class ImageVideoWriter:
            self.encoder = cv2.VideoWriter(self.outfile, cv2.VideoWriter_fourcc(*self.fourcc), self.rate, size)
         # TODO reps
         self.encoder.write(img)
+        self.frame += 1
+        if self.frame >= self.nframes:
+            dostop = True
         if self.display:
             cv2.imshow(self.topic, img)
 
@@ -149,9 +196,9 @@ class DepthVideoWriter:
         self.bridge = CvBridge()
         self.rate = 30.0
         self.timestampfile = open(outfile + ".timestamp","w")
-        self.xrate = rospy.Rate(30) # 10hz        
         self.publisher = outpublisher
         if outpublisher is not None:
+            self.xrate = rospy.Rate(30) # 10hz        
             self.bridge = CvBridge()
         if self.display:
             cv2.namedWindow(self.topic)
@@ -159,21 +206,42 @@ class DepthVideoWriter:
         self.timestampfile.write("%f\n" % msg.header.stamp.to_time())
         size = (msg.width, msg.height)
         dimg = np.asarray(self.bridge.imgmsg_to_cv2(msg, '16UC1'))
-        img = np.zeros((msg.height,msg.width,3),dtype=np.uint8)
-        #most significative on blue (first)
-        img[:,:,1] = np.bitwise_and(dimg,0xFF).astype(np.uint8)
-        img[:,:,0] = np.right_shift(dimg,8).astype(np.uint8)
-        img[:,:,2] = img[:,:,0]
+        neededcolor = self.fourcc != "xn16" and self.fourcc != "xpng"
+        if neededcolor:
+            img = np.zeros((msg.height,msg.width,3),dtype=np.uint8)
+            #most significative on blue (first)
+            img[:,:,1] = np.bitwise_and(dimg,0xFF).astype(np.uint8)
+            img[:,:,0] = np.right_shift(dimg,8).astype(np.uint8)
+            img[:,:,2] = img[:,:,0]
+        else:
+            img = dimg
         if self.encoder is None:
-           self.encoder = cv2.VideoWriter(self.outfile, cv2.VideoWriter_fourcc(*self.fourcc), self.rate, size)
-        self.encoder.write(img)
+           if self.fourcc == "xn16":
+             self.encoder = XNEncWriter(self.outfile,img.shape)
+           elif self.fourcc == "xpng":
+             self.encoder = PNGWriter(self.outfile,img.shape,7000)
+           else:
+               if self.fourcc == "libx264":
+                 pixelformat = "yuv444p"
+                 print "you will have artifacts"
+               elif self.fourcc == "png":
+                 pixelformat = "rgb24" #yuv420p" if self.fourcc.lower() not in set(["ffv1","huffyuv"]) else "rgb8"
+               else:
+                 pixelformat = "bgr0" #yuv420p" if self.fourcc.lower() not in set(["ffv1","huffyuv"]) else "rgb8"
+               print "using pixelformat",pixelformat,"codec",self.fourcc
+               self.encoder = imageio.get_writer(self.outfile,fps=self.rate,pixelformat=pixelformat,codec=self.fourcc,quality=10)
+               print dir(self.encoder)
+           #self.encoder = cv2.VideoWriter(self.outfile, cv2.VideoWriter_fourcc(*self.fourcc), self.rate, size)
+        self.encoder.append_data(img)
+        #self.encoder.write(img)
         if self.publisher is not None:
             msg.header.stamp = rospy.get_rostime()
             self.publisher[0].publish(msg)
-            x = self.bridge.cv2_to_imgmsg(twincolor2depth(img), encoding="16UC1")
-            self.publisher[1].publish(x)
-            x = self.bridge.cv2_to_imgmsg((twincolor2depth(img)-dimg)*10, encoding="16UC1")
-            self.publisher[2].publish(x)
+            if neededcolor:
+                x = self.bridge.cv2_to_imgmsg(twincolor2depth(img), encoding="16UC1")
+                self.publisher[1].publish(x)
+                x = self.bridge.cv2_to_imgmsg((twincolor2depth(img)-dimg)*10, encoding="16UC1")
+                self.publisher[2].publish(x)
             self.xrate.sleep()
         if self.display:
             cv2.imshow(self.topic, img)
@@ -182,7 +250,8 @@ class DepthVideoWriter:
         pass
     def close(self):
         if self.encoder:
-            self.encoder.release()
+            #self.encoder.release()
+            self.encoder.close()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Extract and encode video from bag files.')
@@ -206,28 +275,36 @@ if __name__ == '__main__':
                         help='Rostime representing where to stop in the bag.')
     parser.add_argument('--encoding', choices=('rgb8', 'bgr8', 'mono8'), default='bgr8',
                         help='Encoding of the deserialized image.')
-    parser.add_argument('--dtopic')
-    parser.add_argument('--stopic')
-    parser.add_argument('--ctopic')
-    parser.add_argument('--republishdepth')
+    parser.add_argument('--topic',help="camerainfo")
+    parser.add_argument('--dtopic',help="depth")
+    parser.add_argument('--stopic',help="skeleton")
+    parser.add_argument('--ext',default="avi")
+    parser.add_argument('--frames',default=10000000000,type=int)
+    parser.add_argument('--ctopic',help="camera info")
+    parser.add_argument('--republishdepth',default=None)
     parser.add_argument('--display',action="store_true")
     parser.add_argument('--ddisplay',action="store_true")
     parser.add_argument('--twopasses',action="store_true")
     parser.add_argument('--fourcc',default="H264")
     parser.add_argument('--dfourcc',default="FFV1",help="lossless is suggested, e.g. HFYU FFV1")
 
-    parser.add_argument('--topic')
     parser.add_argument('--sync',default=True,type=bool)
     parser.add_argument('bagfile')
     
     args = parser.parse_args()
 
-    if args.republishdepth != "":
+    if args.republishdepth is not None:
         rospy.init_node('image_converter', anonymous=True)
         image_pubD = (rospy.Publisher(args.republishdepth,Image),rospy.Publisher(args.republishdepth+"re",Image),rospy.Publisher(args.republishdepth+"de",Image))
     else:
-        image_pubD = None
+        image_pubD = None   
 
+    ext = "." + args.ext
+    dext = ext
+    if args.dfourcc == "xn16":
+        dext = ".xn16"
+    elif args.dfourcc == "xpng":
+        dext = ".xpng"
 
     for bagfile in glob.glob(args.bagfile):
         print bagfile
@@ -235,22 +312,22 @@ if __name__ == '__main__':
             break
         outfile = args.outfile
         #if not outfile:
-        #    outfile = os.path.join(*os.path.split(bagfile)[-1].split('.')[:-1]) + '.avi'
+        #    outfile = os.path.join(*os.path.split(bagfile)[-1].split('.')[:-1]) + '' + ext
         bag = rosbag.Bag(bagfile, 'r')
 
         if args.outfile is None:
             if args.outpath:
-                outfile = os.path.join(args.outpath,os.path.splitext(os.path.split(bagfile)[-1])[0]+".avi")
+                outfile = os.path.join(args.outpath,os.path.splitext(os.path.split(bagfile)[-1])[0]+ext)
             else:
-                outfile = os.path.join(*os.path.split(bagfile)[-1].split('.')[:-1]) + '.avi'
+                outfile = os.path.join(*os.path.split(bagfile)[-1].split('.')[:-1]) + '' + ext
         else:
             outfile = args.outfile
 
         if args.doutfile is None:
             if args.outpath:
-                doutfile = os.path.join(args.outpath,os.path.splitext(os.path.split(bagfile)[-1])[0]+"-D.avi")
+                doutfile = os.path.join(args.outpath,os.path.splitext(os.path.split(bagfile)[-1])[0]+"-D" + dext)
             else:
-                doutfile = os.path.join(*os.path.split(bagfile)[-1].split('.')[:-1]) + '-D.avi'
+                doutfile = os.path.join(*os.path.split(bagfile)[-1].split('.')[:-1]) + '-D' + dext
         else:
             doutfile = args.doutfile
 
@@ -275,7 +352,7 @@ if __name__ == '__main__':
         ac = None
         ad = None
         if args.topic:
-            aa = ImageVideoWriter(args.topic,outfile,args.encoding,args.fourcc,args.display)
+            aa = ImageVideoWriter(args.topic,outfile,args.encoding,args.fourcc,args.display,args.frames)
             print "looking for color with",aa.topic
         if args.dtopic:
             ab = DepthVideoWriter(args.dtopic,doutfile,"",args.dfourcc,args.ddisplay,image_pubD)
@@ -285,7 +362,7 @@ if __name__ == '__main__':
             print "looking for depth with",ac.topic
         if args.ctopic:
             ad = CameraInfoWriter(args.ctopic,coutfile)
-            print "looking for depth with",ad.topic
+            print "looking for camera info with",ad.topic,"writing to",ad.outfile
         targets = [x for x in (aa,ab,ac,ad) if x is not None]
         topics = [x.topic for x in targets]
 
@@ -302,6 +379,7 @@ if __name__ == '__main__':
             iterator = bag.read_messages(topics=topics, start_time=args.start, end_time=args.stop)
             for (topic, msg, time) in iterator:
                 if dostop:
+                    print "stopping...."
                     break
                 if aa and aa.topic == topic:
                     aa.message1(msg,time)
@@ -312,6 +390,7 @@ if __name__ == '__main__':
             ds = dict(zip(topics,targets))
             for (topic, msg, time) in iterator:
                 if dostop:
+                    print "stopping...."
                     break
                 ds[topic].message(msg,time)
                 if args.display or args.ddisplay:
@@ -323,6 +402,9 @@ if __name__ == '__main__':
             ts.registerCallback(lambda *args: [x.message(y,y.header.stamp) for (x,y) in zip(targets,args)])
             iterator = bag.read_messages(topics=topics, start_time=args.start, end_time=args.stop)
             for (topic, msg, time) in iterator:
+                if dostop:
+                    print "stopping...."
+                    break
                 ds[topic].signalMessage(msg) # calls ts.add that MAYBE calls lambda that in turns calls message of the writer
 
         for x in targets:
