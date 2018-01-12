@@ -286,7 +286,7 @@ if __name__ == '__main__':
     parser.add_argument('--ddisplay',action="store_true")
     parser.add_argument('--twopasses',action="store_true")
     parser.add_argument('--fourcc',default="H264")
-    parser.add_argument('--dfourcc',default="FFV1",help="lossless is suggested, e.g. HFYU FFV1")
+    parser.add_argument('--dfourcc',default="png",help="ffv1 for ffmpeg using color, png for depth, xpng for custom stored png, xn16 for OpenNI 16bit, otherwise it is the ffmpeg codec")
 
     parser.add_argument('--sync',default=True,type=bool)
     parser.add_argument('bagfile')
