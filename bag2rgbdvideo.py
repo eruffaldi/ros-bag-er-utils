@@ -1,11 +1,22 @@
 #!/usr/bin/env python
+#
 from __future__ import division
 import rosbag, rospy, numpy as np
 import sys, os, cv2, glob
 from itertools import izip, repeat
 import argparse
 import signal
+import timesync
+import json
+import yaml
+import message_filters
+from sensor_msgs.msg import Image
 
+   
+def msg2json(msg):
+   ''' Convert a ROS message to JSON format'''
+   y = yaml.load(str(msg))
+   return json.dumps(y,indent=4)
 
 dostop=False
 def signal_handler(signal, frame):
@@ -30,6 +41,9 @@ except ImportError:
         print "Could not find ROS package: cv_bridge"
         print "If ROS version is pre-Groovy, try putting this package in ROS_PACKAGE_PATH"
         sys.exit(1)
+def twincolor2depth(img):
+    return np.bitwise_or(np.left_shift(img[:,:,0].astype(np.uint16),8),img[:,:,1].astype(np.uint16))
+
 
 #NOT USED
 #from https://github.com/OSUrobotics/bag2video/blob/master/bag2video.py
@@ -58,6 +72,39 @@ def calc_n_frames(times, precision=10):
     intervals = np.diff(times)
     return np.int64(np.round(precision*intervals/min(intervals)))
 
+class SkeletonWriter:
+    def __init__(self,topic,outfile):
+        self.topic = topic
+        self.outfile = outfile
+        self.outfilef = open(outfile,"wb")
+        self.timestampfile = open(outfile + ".timestamp","w")
+    def message(self,msg,time):
+        #first pass for precisely estimating timestamp
+        self.outfilef.write(msg2json(msg)+"\n")
+        self.timestampfile.write("%f\n" % msg.header.stamp.to_time())
+    def message1(self,msg,time):
+        #first pass for precisely estimating timestamp
+        pass
+    def close(self):
+        self.outfilef.close()
+        self.timestampfile.close()
+
+class CameraInfoWriter:
+    def __init__(self,topic,outfile):
+        self.topic = topic
+        self.outfile = outfile
+        self.outfilef = open(outfile,"wb")
+        self.done = False
+    def message1(self,msg,time):
+        #first pass for precisely estimating timestamp
+        pass
+    def message(self,msg,time):
+        #first pass for precisely estimating timestamp
+        if not self.done:
+            self.outfilef.write(msg2json(msg))
+            self.done = True
+    def close(self):
+        self.outfilef.close()
 
 class ImageVideoWriter:
     def __init__(self,topic,outfile,encoding,fourcc,dis):
@@ -68,7 +115,7 @@ class ImageVideoWriter:
         self.encoding = encoding
         self.encoder = None
         self.bridge = CvBridge()
-        self.rate = 30
+        self.rate = 30.0
         self.timestampfile = open(outfile + ".timestamp","w")
         if self.display:
             cv2.namedWindow(self.topic)
@@ -92,7 +139,7 @@ class ImageVideoWriter:
             self.encoder.release()
 
 class DepthVideoWriter:
-    def __init__(self,topic,outfile,en,fourcc,dis):
+    def __init__(self,topic,outfile,en,fourcc,dis,outpublisher):
         self.topic = topic
         self.encoding = en
         self.fourcc = fourcc
@@ -100,8 +147,12 @@ class DepthVideoWriter:
         self.display = dis
         self.encoder = None
         self.bridge = CvBridge()
-        self.rate = 30
+        self.rate = 30.0
         self.timestampfile = open(outfile + ".timestamp","w")
+        self.xrate = rospy.Rate(30) # 10hz        
+        self.publisher = outpublisher
+        if outpublisher is not None:
+            self.bridge = CvBridge()
         if self.display:
             cv2.namedWindow(self.topic)
     def message(self,msg,time):
@@ -116,6 +167,14 @@ class DepthVideoWriter:
         if self.encoder is None:
            self.encoder = cv2.VideoWriter(self.outfile, cv2.VideoWriter_fourcc(*self.fourcc), self.rate, size)
         self.encoder.write(img)
+        if self.publisher is not None:
+            msg.header.stamp = rospy.get_rostime()
+            self.publisher[0].publish(msg)
+            x = self.bridge.cv2_to_imgmsg(twincolor2depth(img), encoding="16UC1")
+            self.publisher[1].publish(x)
+            x = self.bridge.cv2_to_imgmsg((twincolor2depth(img)-dimg)*10, encoding="16UC1")
+            self.publisher[2].publish(x)
+            self.xrate.sleep()
         if self.display:
             cv2.imshow(self.topic, img)
     def message1(self,msg,time):
@@ -134,6 +193,10 @@ if __name__ == '__main__':
                         help='Destination of the video file. Defaults to the location of the input file.')
     parser.add_argument('--doutfile', '-O', action='store', default=None,
                         help='Destination of the video file. Defaults to the location of the input file.')
+    parser.add_argument('--coutfile', '-C', action='store', default=None,
+                        help='Destination of the video file. Defaults to the location of the input file.')
+    parser.add_argument('--soutfile', action='store', default=None,
+                        help='Destination of the video file. Defaults to the location of the input file.')
     parser.add_argument('--precision', '-p', action='store', default=10, type=int,
                         help='Precision of variable framerate interpolation. Higher numbers\
                         match the actual framerater better, but result in larger files and slower conversion times.')
@@ -144,6 +207,9 @@ if __name__ == '__main__':
     parser.add_argument('--encoding', choices=('rgb8', 'bgr8', 'mono8'), default='bgr8',
                         help='Encoding of the deserialized image.')
     parser.add_argument('--dtopic')
+    parser.add_argument('--stopic')
+    parser.add_argument('--ctopic')
+    parser.add_argument('--republishdepth')
     parser.add_argument('--display',action="store_true")
     parser.add_argument('--ddisplay',action="store_true")
     parser.add_argument('--twopasses',action="store_true")
@@ -151,10 +217,16 @@ if __name__ == '__main__':
     parser.add_argument('--dfourcc',default="FFV1",help="lossless is suggested, e.g. HFYU FFV1")
 
     parser.add_argument('--topic')
+    parser.add_argument('--sync',default=True,type=bool)
     parser.add_argument('bagfile')
-
+    
     args = parser.parse_args()
 
+    if args.republishdepth != "":
+        rospy.init_node('image_converter', anonymous=True)
+        image_pubD = (rospy.Publisher(args.republishdepth,Image),rospy.Publisher(args.republishdepth+"re",Image),rospy.Publisher(args.republishdepth+"de",Image))
+    else:
+        image_pubD = None
 
 
     for bagfile in glob.glob(args.bagfile):
@@ -182,17 +254,40 @@ if __name__ == '__main__':
         else:
             doutfile = args.doutfile
 
+        if args.soutfile is None:
+            if args.outpath:
+                soutfile = os.path.join(args.outpath,os.path.splitext(os.path.split(bagfile)[-1])[0]+"-S.json")
+            else:
+                soutfile = os.path.join(*os.path.split(bagfile)[-1].split('.')[:-1]) + '-S.json'
+        else:
+            soutfile = args.soutfile
+
+        if args.coutfile is None:
+            if args.outpath:
+                coutfile = os.path.join(args.outpath,os.path.splitext(os.path.split(bagfile)[-1])[0]+"-C.json")
+            else:
+                coutfile = os.path.join(*os.path.split(bagfile)[-1].split('.')[:-1]) + '-C.json'
+        else:
+            coutfile = args.coutfile
+
         aa = None
         ab = None
-        topics = []
+        ac = None
+        ad = None
         if args.topic:
             aa = ImageVideoWriter(args.topic,outfile,args.encoding,args.fourcc,args.display)
-            topics.append(args.topic)
             print "looking for color with",aa.topic
         if args.dtopic:
-            ab = DepthVideoWriter(args.dtopic,doutfile,"",args.dfourcc,args.ddisplay)
-            topics.append(args.dtopic)
+            ab = DepthVideoWriter(args.dtopic,doutfile,"",args.dfourcc,args.ddisplay,image_pubD)
             print "looking for depth with",ab.topic
+        if args.stopic:
+            ac = SkeletonWriter(args.stopic,soutfile)
+            print "looking for depth with",ac.topic
+        if args.ctopic:
+            ad = CameraInfoWriter(args.ctopic,coutfile)
+            print "looking for depth with",ad.topic
+        targets = [x for x in (aa,ab,ac,ad) if x is not None]
+        topics = [x.topic for x in targets]
 
         #        print 'Calculating video properties'
         #rate, minrate, maxrate, size, times = get_info(bag, args.topic, start_time=args.start, stop_time=args.end)
@@ -212,20 +307,23 @@ if __name__ == '__main__':
                     aa.message1(msg,time)
                 elif ab and ab.topic == topic:
                     ab.message1(msg.time)
-        print aa,ab
-        iterator = bag.read_messages(topics=topics, start_time=args.start, end_time=args.stop)
-        for (topic, msg, time) in iterator:
-            if dostop:
-                break
-            if aa is not None and aa.topic == topic:
-                aa.message(msg,time)
-            if ab  is not None and ab.topic == topic:
-                ab.message(msg,time)
-            else:
-                continue
-            if args.display or args.ddisplay:
-                cv2.waitKey(1)
-        if aa:
-            aa.close()
-        if ab:
-            ab.close()
+        if not args.sync or len(targets) == 1:
+            iterator = bag.read_messages(topics=topics, start_time=args.start, end_time=args.stop)
+            ds = dict(zip(topics,targets))
+            for (topic, msg, time) in iterator:
+                if dostop:
+                    break
+                ds[topic].message(msg,time)
+                if args.display or args.ddisplay:
+                    cv2.waitKey(1)
+        else:
+            dsv = [timesync.SimpleFilter() for i in range(0,len(targets))]
+            ds = dict(zip(topics,dsv))
+            ts = timesync.ApproximateTimeSynchronizer(dsv,5,0.3)
+            ts.registerCallback(lambda *args: [x.message(y,y.header.stamp) for (x,y) in zip(targets,args)])
+            iterator = bag.read_messages(topics=topics, start_time=args.start, end_time=args.stop)
+            for (topic, msg, time) in iterator:
+                ds[topic].signalMessage(msg) # calls ts.add that MAYBE calls lambda that in turns calls message of the writer
+
+        for x in targets:
+            x.close()
